@@ -9,6 +9,8 @@ This TCL script integrates Ollama AI models with an Eggdrop IRC bot, allowing us
 - Query Ollama AI models from IRC with `!gpt` command
 - Dynamic model switching without bot restart
 - Custom system prompts to modify model behavior
+- **Per-user rate limiting** to prevent abuse
+- **Conversation context** - bot remembers recent exchanges in each channel
 - Automatic response splitting for long messages
 - Progress indicators for long-running queries
 - Model availability checking
@@ -46,6 +48,13 @@ set ollama_model "llama3.1:8b"         # Default model to use
 set ollama_system_prompt ""            # Custom system prompt (empty = model default)
 set max_response_length 400            # Max characters per IRC message
 set timeout 120                        # HTTP request timeout in seconds
+
+# Rate limiting
+set query_limit 5                      # Max queries per time window
+set query_window 60                    # Time window in seconds (60 = 1 minute)
+
+# Conversation context
+set max_context_messages 5             # Number of previous exchanges to remember
 ```
 
 ## Commands
@@ -63,10 +72,17 @@ Query the AI model with a question or prompt.
 
 **Behavior:**
 - Sends query to configured Ollama model
-- Shows "Processing your request" message
+- Maintains conversation context (remembers previous exchanges in the channel)
+- Rate limited per user to prevent abuse (default: 5 queries per minute)
 - Displays progress indicator after 15 seconds if still processing
 - Splits long responses across multiple messages
 - Applies custom system prompt if configured
+
+**Rate Limiting:**
+If you exceed the rate limit, you'll see:
+```
+<bot> user: Rate limit exceeded. Please wait 45 seconds.
+```
 
 ### `!gpt-status`
 
@@ -145,14 +161,38 @@ Set, view, or clear a custom system prompt.
 - Persists until cleared or bot restart
 - Displayed prompts are truncated to 200 characters in chat
 
+### `!gpt-clear`
+
+Clear the conversation context for the current channel.
+
+**Example:**
+```
+!gpt-clear
+```
+
+**Response:**
+```
+<bot> user: Conversation context cleared for this channel.
+```
+
+**Behavior:**
+- Removes all stored conversation history for the channel
+- Useful when starting a new topic or conversation
+- Does not affect other channels
+- Context automatically resets when bot restarts
+
 ## Usage Examples
 
-### Basic Query
+### Basic Query with Context
 ```
-<user> !gpt What's the population of China?
-<bot> user: Processing your request (this may take up to 2 minutes)...
-<bot> user: China's population is approximately 1.4 billion people, making it the world's most populous country...
+<user> !gpt What's the capital of France?
+<bot> user: The capital of France is Paris.
+
+<user> !gpt How many people live there?
+<bot> user: Paris has approximately 2.2 million people within the city limits...
 ```
+
+Note: The second question uses context from the first, understanding "there" refers to Paris.
 
 ### Switching Models
 ```
@@ -178,7 +218,55 @@ Set, view, or clear a custom system prompt.
 <bot> user: System prompt cleared (model will use its default)
 ```
 
+### Managing Conversation Context
+```
+<user> !gpt Tell me about Python
+<bot> user: Python is a high-level programming language known for its simplicity...
+
+<user> !gpt What are its main uses?
+<bot> user: Python is widely used for web development, data science, automation...
+
+<user> !gpt-clear
+<bot> user: Conversation context cleared for this channel.
+
+<user> !gpt What are its main uses?
+<bot> user: Could you clarify what "it" refers to?
+```
+
+### Rate Limiting Example
+```
+<user> !gpt Question 1
+<bot> user: Answer 1
+
+<user> !gpt Question 2
+<bot> user: Answer 2
+
+... (3 more queries) ...
+
+<user> !gpt Question 6
+<bot> user: Rate limit exceeded. Please wait 42 seconds.
+```
+
 ## Performance Tips
+
+### Conversation Context
+
+The bot maintains context of the last 5 exchanges per channel:
+
+- **First query** starts fresh context
+- **Follow-up queries** use previous exchanges for better understanding
+- **Clear context** with `!gpt-clear` when changing topics
+- **Automatic cleanup** keeps only recent exchanges to manage memory
+
+**Benefits:**
+- More natural conversations
+- Bot understands pronouns and references
+- Better multi-turn dialogues
+
+**Considerations:**
+- Larger context = slightly slower responses
+- Clear context when switching topics for better results
+- Context is per-channel (multiple channels maintain separate contexts)
 
 ### Model Selection
 
@@ -202,9 +290,13 @@ Different models have different performance characteristics:
 
 2. **First Query**: First query after bot start will be slower as model loads into memory
 
-3. **Timeout Setting**: Default 120 seconds handles most queries. Increase if using very large models or complex prompts
+3. **Context Impact**: Queries with conversation context are slightly slower due to additional context processing
 
-4. **Hardware**: Ollama performance depends on:
+4. **Clear Context**: Use `!gpt-clear` when switching topics to avoid irrelevant context
+
+5. **Timeout Setting**: Default 120 seconds handles most queries. Increase if using very large models or complex prompts
+
+6. **Hardware**: Ollama performance depends on:
    - CPU/GPU available
    - RAM for model loading
    - Network latency over WireGuard
@@ -254,33 +346,47 @@ Different models have different performance characteristics:
 The script logs to Eggdrop's standard log:
 
 ```
-[16:53:20] Querying Ollama at http://10.66.66.5:11434/api/generate with model llama3.1:8b
+[16:53:20] Querying Ollama at http://10.66.66.5:11434/api/generate with model llama3.1:8b (user: nick, chan: #channel)
 [16:53:20] JSON payload: {"model": "llama3.1:8b", "prompt": "Population of China", "stream": false}
 [16:54:33] HTTP Status: ok, Code: 200
+[16:55:10] Conversation context cleared by nick in #channel
 ```
 
 **Log Information:**
-- Query timestamps
+- Query timestamps with user and channel info
 - Model being used
-- JSON payloads sent
+- JSON payloads sent (including context)
 - HTTP status codes
 - Error messages
 - Model changes
 - System prompt changes
+- Rate limit hits
+- Context clears
 
 ## Security Considerations
 
 1. **Access Control**: Anyone in the channel can use the bot. Consider:
    - Restricting to specific channels
    - Adding user authentication
-   - Rate limiting queries
+   - Built-in rate limiting prevents spam (5 queries/minute default)
 
 2. **System Prompts**: Users can set system prompts. Consider:
    - Restricting `!gpt-system` to ops/voiced users
-   - Logging all system prompt changes
+   - Logging all system prompt changes (already implemented)
    - Validating prompt content
 
-3. **Network Security**:
+3. **Conversation Context**:
+   - Context is per-channel, not per-user
+   - All users in a channel share the same context
+   - Anyone can clear context with `!gpt-clear`
+   - Consider restricting `!gpt-clear` to ops if needed
+
+4. **Rate Limiting**:
+   - Default: 5 queries per 60 seconds per user per channel
+   - Prevents abuse and API overload
+   - Adjust `query_limit` and `query_window` as needed
+
+5. **Network Security**:
    - WireGuard provides encrypted connection
    - Ensure Ollama is not exposed to public internet
    - Use firewall rules to restrict access
@@ -289,7 +395,7 @@ The script logs to Eggdrop's standard log:
 
 ### Restrict Commands to Operators
 
-Add this to restrict system prompt changes to ops:
+Add this to restrict system prompt and context clearing to ops:
 
 ```tcl
 proc gpt_system {nick uhost hand chan text} {
@@ -303,26 +409,52 @@ proc gpt_system {nick uhost hand chan text} {
     
     # ... rest of function
 }
-```
 
-### Add Per-User Rate Limiting
-
-```tcl
-# At top of script
-set query_tracker [dict create]
-set query_limit 5  ;# queries per minute
-
-# In gpt_query proc, add before processing:
-set current_time [clock seconds]
-if {[dict exists $query_tracker $nick]} {
-    set user_queries [dict get $query_tracker $nick]
-    set recent_queries [lsearch -all -inline $user_queries [list * $current_time]]
-    if {[llength $recent_queries] >= $query_limit} {
-        putserv "PRIVMSG $chan :\002$nick\002: Rate limit exceeded. Please wait."
+proc gpt_clear {nick uhost hand chan text} {
+    global conversation_history
+    
+    # Check if user is op
+    if {![isop $nick $chan] && ![matchattr $hand o]} {
+        putserv "PRIVMSG $chan :\002$nick\002: Only operators can clear context"
         return
     }
+    
+    # ... rest of function
 }
 ```
+
+### Adjust Rate Limiting
+
+Change these values at the top of the script:
+
+```tcl
+set query_limit 10     ;# Allow 10 queries
+set query_window 120   ;# Per 2 minutes (120 seconds)
+```
+
+### Adjust Context Memory
+
+Change the context size:
+
+```tcl
+set max_context_messages 10  ;# Remember last 10 exchanges instead of 5
+```
+
+**Note:** More context = slightly slower responses and more memory usage.
+
+### Per-User Context (Instead of Per-Channel)
+
+Replace context tracking in `gpt_query` to make context per-user:
+
+```tcl
+# Change this line:
+set context_key $chan
+
+# To this:
+set context_key "${chan}:${nick}"
+```
+
+This gives each user their own context instead of sharing channel-wide.
 
 ### Change Response Format
 
@@ -333,19 +465,16 @@ Modify `send_response` proc to change how responses are formatted:
 putserv "PRIVMSG $chan :\002$nick\002 [[clock format [clock seconds] -format "%H:%M"]]: $response"
 ```
 
-### Add Conversation Context
+### Disable Context for Specific Channels
 
-Store previous messages to maintain context across queries:
+Add this at the start of `gpt_query`:
 
 ```tcl
-# At top of script
-set conversation_history [dict create]
-set max_history 5
-
-# Modify query to include history
-if {[dict exists $conversation_history $chan]} {
-    set history [dict get $conversation_history $chan]
-    # Append to prompt
+# Disable context for #no-context channel
+if {$chan eq "#no-context"} {
+    set full_prompt $query
+} else {
+    # ... normal context building code
 }
 ```
 
@@ -374,25 +503,33 @@ GET http://10.66.66.5:11434/api/tags
 
 ## Changelog
 
-### Version 1.0
-- Initial release
-- Basic `!gpt` query functionality
-- Model listing and status checking
+### Version 1.4 (Current)
+- Removed "Processing your request" message to reduce channel clutter
+- Added per-user rate limiting (5 queries per 60 seconds)
+- Added conversation context tracking (remembers last 5 exchanges per channel)
+- Added `!gpt-clear` command to clear conversation context
+- Enhanced logging with user and channel information
+- Context-aware responses for better multi-turn conversations
 
-### Version 1.1
-- Added timeout increase to 120 seconds
-- Added progress indicators
-- Added keep-alive for faster subsequent queries
+### Version 1.3
+- Added custom system prompt support with `!gpt-system`
+- System prompt validation and sanitization
+- Better logging of configuration changes
 
 ### Version 1.2
 - Added dynamic model switching with `!gpt-model`
 - Model validation before switching
 - Enhanced error messages
 
-### Version 1.3
-- Added custom system prompt support with `!gpt-system`
-- System prompt validation and sanitization
-- Better logging of configuration changes
+### Version 1.1
+- Added timeout increase to 120 seconds
+- Added progress indicators
+- Added keep-alive for faster subsequent queries
+
+### Version 1.0
+- Initial release
+- Basic `!gpt` query functionality
+- Model listing and status checking
 
 ## Support and Resources
 
@@ -408,4 +545,4 @@ This script is provided as-is for use with Eggdrop IRC bots. Modify and distribu
 
 Created for integration between Eggdrop IRC bots and Ollama AI models via WireGuard networking.
 
-This script and the documentation for it was entirely generated by [Claude AI](https://claude.ai), with minimal troubleshooting by yours truly.
+This script and the documentation for it was entirely generated by [Claude AI]https://claude.ai/), with minimal troubleshooting by yours truly.

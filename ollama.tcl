@@ -10,6 +10,15 @@ set ollama_system_prompt ""  ;# Custom system prompt (empty = use model default)
 set max_response_length 400  ;# Maximum characters for IRC response
 set timeout 120  ;# Timeout in seconds for HTTP requests
 
+# Rate limiting configuration
+set query_limit 5  ;# Maximum queries per time window
+set query_window 60  ;# Time window in seconds (60 = 1 minute)
+set query_tracker [dict create]
+
+# Conversation context configuration
+set max_context_messages 5  ;# Number of previous exchanges to remember
+set conversation_history [dict create]
+
 # Load required packages
 package require http
 package require json
@@ -24,6 +33,7 @@ bind pub - "!gpt" gpt_query
 # Main procedure to handle !gpt commands
 proc gpt_query {nick uhost hand chan text} {
     global ollama_host ollama_port ollama_model ollama_system_prompt max_response_length timeout
+    global query_tracker query_limit query_window conversation_history max_context_messages
     
     # Check if user provided a query
     set query [string trim $text]
@@ -32,24 +42,66 @@ proc gpt_query {nick uhost hand chan text} {
         return
     }
     
+    # Rate limiting check
+    set current_time [clock seconds]
+    set user_key "${chan}:${nick}"
+    
+    if {[dict exists $query_tracker $user_key]} {
+        set user_queries [dict get $query_tracker $user_key]
+        # Filter queries within the time window
+        set recent_queries [list]
+        foreach query_time $user_queries {
+            if {[expr $current_time - $query_time] < $query_window} {
+                lappend recent_queries $query_time
+            }
+        }
+        
+        if {[llength $recent_queries] >= $query_limit} {
+            putserv "PRIVMSG $chan :\002$nick\002: Rate limit exceeded. Please wait [expr $query_window - ($current_time - [lindex $recent_queries 0])] seconds."
+            return
+        }
+        
+        # Update tracker with filtered list plus new query
+        lappend recent_queries $current_time
+        dict set query_tracker $user_key $recent_queries
+    } else {
+        dict set query_tracker $user_key [list $current_time]
+    }
+    
+    # Build context-aware prompt
+    set context_key $chan
+    set full_prompt $query
+    
+    if {[dict exists $conversation_history $context_key]} {
+        set history [dict get $conversation_history $context_key]
+        if {[llength $history] > 0} {
+            set context_prompt "Previous conversation:\n"
+            foreach exchange $history {
+                lassign $exchange user_msg assistant_msg
+                append context_prompt "User: $user_msg\nAssistant: $assistant_msg\n"
+            }
+            append context_prompt "\nCurrent question: $query"
+            set full_prompt $context_prompt
+        }
+    }
+    
     # Sanitize the query for JSON
-    set query [string map {"\\" "\\\\" "\"" "\\\"" "\n" "\\n" "\r" "\\r" "\t" "\\t"} $query]
+    set full_prompt [string map {"\\" "\\\\" "\"" "\\\"" "\n" "\\n" "\r" "\\r" "\t" "\\t"} $full_prompt]
     
     # Prepare JSON payload for Ollama API (with keep-alive to speed up subsequent queries)
     if {$ollama_system_prompt ne ""} {
         # Sanitize system prompt for JSON
         set sys_prompt [string map {"\\" "\\\\" "\"" "\\\"" "\n" "\\n" "\r" "\\r" "\t" "\\t"} $ollama_system_prompt]
-        set json_data "{\"model\": \"$ollama_model\", \"prompt\": \"$query\", \"system\": \"$sys_prompt\", \"stream\": false, \"keep_alive\": \"10m\"}"
+        set json_data "{\"model\": \"$ollama_model\", \"prompt\": \"$full_prompt\", \"system\": \"$sys_prompt\", \"stream\": false, \"keep_alive\": \"10m\"}"
     } else {
-        set json_data "{\"model\": \"$ollama_model\", \"prompt\": \"$query\", \"stream\": false, \"keep_alive\": \"10m\"}"
+        set json_data "{\"model\": \"$ollama_model\", \"prompt\": \"$full_prompt\", \"stream\": false, \"keep_alive\": \"10m\"}"
     }
     
     # Make HTTP request to Ollama
     set url "http://${ollama_host}:${ollama_port}/api/generate"
     
-    putlog "Querying Ollama at $url with model $ollama_model"
+    putlog "Querying Ollama at $url with model $ollama_model (user: $nick, chan: $chan)"
     putlog "JSON payload: $json_data"
-    putserv "PRIVMSG $chan :\002$nick\002: Processing your request (this may take up to 2 minutes)..."
     
     # Start a timer for progress updates on long queries
     set progress_timer [after 15000 [list progress_update $chan $nick]]
@@ -112,6 +164,21 @@ proc gpt_query {nick uhost hand chan text} {
     # Clean up the response
     set ollama_response [string trim $ollama_response]
     
+    # Store in conversation history
+    if {![dict exists $conversation_history $context_key]} {
+        dict set conversation_history $context_key [list]
+    }
+    
+    set history [dict get $conversation_history $context_key]
+    lappend history [list $query $ollama_response]
+    
+    # Keep only the last N exchanges
+    if {[llength $history] > $max_context_messages} {
+        set history [lrange $history end-[expr $max_context_messages - 1] end]
+    }
+    
+    dict set conversation_history $context_key $history
+    
     # Split long responses into multiple messages
     send_response $chan $nick $ollama_response $max_response_length
 }
@@ -168,6 +235,21 @@ proc send_response {chan nick response max_length} {
     }
 }
 
+# Optional: Add a command to clear conversation context
+proc gpt_clear {nick uhost hand chan text} {
+    global conversation_history
+    
+    set context_key $chan
+    
+    if {[dict exists $conversation_history $context_key]} {
+        dict unset conversation_history $context_key
+        putserv "PRIVMSG $chan :\002$nick\002: Conversation context cleared for this channel."
+        putlog "Conversation context cleared by $nick in $chan"
+    } else {
+        putserv "PRIVMSG $chan :\002$nick\002: No conversation context to clear."
+    }
+}
+
 # Optional: Add a command to check Ollama status
 bind pub - "!gpt-status" gpt_status
 
@@ -200,6 +282,9 @@ bind pub - "!gpt-model" gpt_model
 
 # Optional: Add a command to set/view custom system prompt
 bind pub - "!gpt-system" gpt_system
+
+# Optional: Add a command to clear conversation context
+bind pub - "!gpt-clear" gpt_clear
 
 # Optional: Add a command to change the current model
 proc gpt_model {nick uhost hand chan text} {
@@ -344,6 +429,8 @@ proc gpt_models {nick uhost hand chan text} {
 
 putlog "Ollama integration script loaded - listening for !gpt commands"
 putlog "Ollama host: $ollama_host:$ollama_port, Model: $ollama_model"
+putlog "Rate limiting: $query_limit queries per $query_window seconds"
+putlog "Conversation context: keeping last $max_context_messages exchanges"
 if {$ollama_system_prompt ne ""} {
     putlog "Custom system prompt active: [string range $ollama_system_prompt 0 100]..."
 }
